@@ -14,12 +14,12 @@ const configuration = new Configuration({
 export const flowGuessService = {
     async guessFlow(question: string): Promise<Trigger> {
         try {
-            const context = await buildContext();
+            const context = await buildExamples(question);
             const flowPrompt = (await fs.readFile('./packages/backend/src/assets/openai/main_prompt.txt', 'utf8')).replace('{question}', question).replace('{context}', context);
             const openAiResponse = await callOpenAI(flowPrompt);
-            console.log("OpenAI Response: ", openAiResponse);
+            logger.info("OpenAI Response: " + JSON.stringify(openAiResponse));
             const flowJson = extractJson(openAiResponse);
-            return cleanAndValidateTrigger(flowJson.trigger);
+            return cleanAndValidateTrigger(flowJson.trigger as any);
         }
         catch (e) {
             logger.error(e);
@@ -40,10 +40,15 @@ function cleanAndValidateTrigger(step: Trigger): Trigger {
         nextAction: cleanAction(step.nextAction, 1),
     }
     switch (step.type) {
-    case TriggerType.PIECE:{
+    case TriggerType.PIECE: {
         const pieceName = getPiece(step.settings.pieceName);
         if (!pieceName) {
-            throw new Error(`Unknown piece ${step.settings.pieceName}`);
+            return {
+                ...basicStep,
+                type: TriggerType.WEBHOOK,
+                settings: {},
+            } as Trigger
+            // throw new Error(`Unknown piece ${step.settings.pieceName}`);
         }
         return {
             ...basicStep,
@@ -63,17 +68,17 @@ function cleanAndValidateTrigger(step: Trigger): Trigger {
             },
         } as Trigger
     case TriggerType.WEBHOOK:
+    default:
         return {
             ...basicStep,
+            type: TriggerType.WEBHOOK,
             settings: {},
         } as Trigger
-    default:
-        throw new Error(`Unknown trigger type ${step.type}`);
     }
 }
 
 function cleanAction(step: any, count: number): Action {
-    if(step === undefined || step === null) {
+    if (step === undefined || step === null) {
         return undefined;
     }
     const basicStep = {
@@ -81,30 +86,49 @@ function cleanAction(step: any, count: number): Action {
         displayName: step.displayName ?? "Untitled Step",
         type: step.type,
         valid: false,
-        nextAction: cleanAction(step.nextAction, 3*count),
+        nextAction: cleanAction(step.nextAction, 3 * count),
     }
     switch (basicStep.type) {
-    case ActionType.BRANCH:{
+    case ActionType.BRANCH: {
+        const failureAction = step.onFailureAction;
+        const successAction = step.OnSuccessAction;
         return {
             ...basicStep,
             settings: {
                 // TODO support this in the prompt
-                firstValue: "",
-                secondValue: "",
-                conditions: []
+                conditions: [[{
+                    firstValue: "",
+                    secondValue: ""
+                }]]
             },
-            onFailureAction: cleanAction(step.onFailureAction, 3*count+1),
-            onSuccessAction: cleanAction(step.onSuccessAction, 3*count+2),
+            onFailureAction: cleanAction(failureAction, 3 * count + 1),
+            onSuccessAction: cleanAction(successAction, 3 * count + 2),
         } as BranchAction
     }
-    case ActionType.PIECE:{
+    case ActionType.PIECE: {
         const pieceName = getPiece(step.settings.pieceName);
         if (!pieceName) {
-            throw new Error(`Unknown piece ${step.settings.pieceName}`);
+            return {
+                ...basicStep,
+                type: ActionType.CODE,
+                settings: {
+                    input: {},
+                    artifact: "UEsDBAoAAAAAAIGZWlYSIpQ2PAAAADwAAAAIAAAAaW5kZXgudHNleHBvcnQgY29uc3QgY29kZSA9IGFzeW5jIChwYXJhbXMpID0+IHsKICAgIHJldHVybiB0cnVlOwp9OwpQSwMECgAAAAAAgZlaVhpS0QgcAAAAHAAAAAwAAABwYWNrYWdlLmpzb257CiAgImRlcGVuZGVuY2llcyI6IHsKICB9Cn0KUEsBAhQACgAAAAAAgZlaVhIilDY8AAAAPAAAAAgAAAAAAAAAAAAAAAAAAAAAAGluZGV4LnRzUEsBAhQACgAAAAAAgZlaVhpS0QgcAAAAHAAAAAwAAAAAAAAAAAAAAAAAYgAAAHBhY2thZ2UuanNvblBLBQYAAAAAAgACAHAAAACoAAAAAAA="
+                }
+            }
+            //throw new Error(`Unknown piece ${step.settings.pieceName}`);
         }
         const action = pieceName.getAction(step.settings.actionName);
         if (!action) {
-            throw new Error(`Unknown action ${step.settings.actionName} for piece ${step.settings.pieceName}`);
+            return {
+                ...basicStep,
+                type: ActionType.CODE,
+                settings: {
+                    input: {},
+                    artifact: "UEsDBAoAAAAAAIGZWlYSIpQ2PAAAADwAAAAIAAAAaW5kZXgudHNleHBvcnQgY29uc3QgY29kZSA9IGFzeW5jIChwYXJhbXMpID0+IHsKICAgIHJldHVybiB0cnVlOwp9OwpQSwMECgAAAAAAgZlaVhpS0QgcAAAAHAAAAAwAAABwYWNrYWdlLmpzb257CiAgImRlcGVuZGVuY2llcyI6IHsKICB9Cn0KUEsBAhQACgAAAAAAgZlaVhIilDY8AAAAPAAAAAgAAAAAAAAAAAAAAAAAAAAAAGluZGV4LnRzUEsBAhQACgAAAAAAgZlaVhpS0QgcAAAAHAAAAAwAAAAAAAAAAAAAAAAAYgAAAHBhY2thZ2UuanNvblBLBQYAAAAAAgACAHAAAACoAAAAAAA="
+                }
+            }
+            // throw new Error(`Unknown action ${step.settings.actionName} for piece ${step.settings.pieceName}`);
         }
         return {
             ...basicStep,
@@ -127,18 +151,40 @@ function snakeToNormal(str: string): string {
     return str.split('_').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
 }
 
-  
-async function buildContext(): Promise<string> {
+
+async function buildExamples(userQuestion: string): Promise<string> {
     const context = [];
     for (const piece of pieces) {
         const actions = Object.keys(piece.metadata().actions);
-        const triggers =Object.keys(piece.metadata().triggers);
-        context.push(`For the following pieceName ${piece.name} These are the action: ${actions}, and triggers are: ${triggers}.`);
+        const triggers = Object.keys(piece.metadata().triggers);
+        context.push({
+            pieceName: piece.metadata().name,
+            actions: actions,
+            triggers: triggers,
+        })
     }
-    return context.join("\n");
+    const flowPrompt = (await fs.readFile('./packages/backend/src/assets/openai/find_examples_prompt.txt', 'utf8')).replace('{question}', userQuestion).replace('{context}', context.join("\n"));
+    const openAiResponse = await callOpenAI(flowPrompt);
+    logger.info("Examples to Provide " + JSON.stringify(openAiResponse));
+    const flowExamples = [];
+    const examplesOutput = JSON.parse(openAiResponse);
+    for (let i = 0; i < examplesOutput.length; i++) {
+        const pieceName = examplesOutput[i].pieceName;
+        for (let j = 0; j < (examplesOutput[i].triggers ?? []).length; j++) {
+            const triggerName = examplesOutput[i].triggers[j];
+            flowExamples.push("Example: Flow triggered by " + pieceName + " " + triggerName);
+            flowExamples.push(`{"trigger":{"type":"PIECE_TRIGGER","settings":{"pieceName":"${pieceName}", "trigerName": "${triggerName}"},"displayName":"Every 5 Min"}}`);
+        }
+        for (let j = 0; j < (examplesOutput[i].actions ?? []).length; j++) {
+            const actionName = examplesOutput[i].actions[j];
+            flowExamples.push("Example: every 5 minutes run " + pieceName + " " + actionName);
+            flowExamples.push(`{ "trigger": { "type": "SCHEDULE", "settings": { "cronExpression": "0/5 * * * *" }, "displayName": "Every 5 Min", "nextAction": { "type": "PIECE", "settings": { "pieceName": "${pieceName}", "actionName": "${actionName}" } } } `);
+        }
+    }
+    return flowExamples.join("\n");
 }
 
-function extractJson(text: string): { trigger: any} {
+function extractJson(text: string): { trigger: any } {
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     const jsonStr = text.substring(start, end + 1).replace(/'/g, '"');
